@@ -18,8 +18,13 @@
 import asyncio
 import logging
 import struct
+import time
 from asyncio import Queue
+from collections import namedtuple, defaultdict
 from concurrent.futures import CancelledError
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Callable, Any
 
 import bitstring
 
@@ -33,9 +38,116 @@ import bitstring
 #
 REQUEST_SIZE = 2**14
 
+# Connection timeout in seconds
+CONNECTION_TIMEOUT = 30.0
+
+# Handshake timeout in seconds
+HANDSHAKE_TIMEOUT = 10.0
+
+# Block pipelining depth - number of outstanding requests per peer.
+# This is a critical optimization for high-latency connections.
+# Industry standard: 5-10 blocks in-flight simultaneously.
+# Higher values = better throughput on high-latency, more memory usage.
+MAX_PIPELINE_DEPTH = 5
+
+# Snubbing timeout in seconds - if a peer doesn't send data for this long
+# after being unchoked, they are considered "snubbed" and deprioritized.
+SNUB_TIMEOUT = 60.0
+
+# Rate calculation window in seconds - used for rolling average
+RATE_WINDOW = 20.0
+
+
+@dataclass
+class PeerStats:
+    """
+    Statistics for a single peer connection.
+    
+    Used for peer ranking and selection to prioritize fast peers.
+    Implements the "choking/optimistic unchoking" algorithm from BitTorrent spec.
+    """
+    peer_id: bytes
+    # Download statistics
+    bytes_downloaded: int = 0
+    blocks_received: int = 0
+    # Timing
+    first_byte_time: float | None = None
+    last_block_time: float | None = None
+    # Rate calculation (rolling window)
+    rate_samples: list[tuple[float, int]] = field(default_factory=list)
+    download_rate: float = 0.0  # bytes per second
+    # State
+    is_snubbed: bool = False
+    is_choked: bool = True
+    connection_start_time: float | None = None
+    
+    def record_block(self, size: int) -> None:
+        """Record a received block and update statistics."""
+        now = time.time()
+        
+        if self.first_byte_time is None:
+            self.first_byte_time = now
+        
+        self.last_block_time = now
+        self.bytes_downloaded += size
+        self.blocks_received += 1
+        self.is_snubbed = False  # Receiving data means not snubbed
+        
+        # Add to rate samples
+        self.rate_samples.append((now, size))
+        
+        # Remove old samples outside the window
+        cutoff = now - RATE_WINDOW
+        self.rate_samples = [
+            (t, s) for t, s in self.rate_samples if t > cutoff
+        ]
+        
+        # Calculate rolling rate
+        if len(self.rate_samples) > 1:
+            total_bytes = sum(s for _, s in self.rate_samples)
+            time_span = self.rate_samples[-1][0] - self.rate_samples[0][0]
+            if time_span > 0:
+                self.download_rate = total_bytes / time_span
+    
+    def check_snubbed(self) -> bool:
+        """Check if peer should be marked as snubbed."""
+        if self.is_choked:
+            return False  # Can't be snubbed if choked
+        if self.last_block_time is None:
+            # Never received data - check connection time
+            if self.connection_start_time is None:
+                return False
+            elapsed = time.time() - self.connection_start_time
+            self.is_snubbed = elapsed > SNUB_TIMEOUT
+        else:
+            elapsed = time.time() - self.last_block_time
+            self.is_snubbed = elapsed > SNUB_TIMEOUT
+        return self.is_snubbed
+    
+    @property
+    def score(self) -> float:
+        """
+        Calculate a score for peer ranking.
+        Higher score = better peer.
+        """
+        if self.is_snubbed:
+            return -1000.0  # Very low priority for snubbed peers
+        if self.is_choked:
+            return -100.0  # Low priority for choked peers (but might unchoke)
+        # Score based on download rate, with bonus for reliability
+        return self.download_rate + (self.blocks_received * 10)
+
 
 class ProtocolError(BaseException):
     pass
+
+
+class ConnectionState(Enum):
+    """Enum for peer connection states."""
+    CHOKED = auto()
+    INTERESTED = auto()
+    PENDING_REQUEST = auto()
+    STOPPED = auto()
 
 
 class PeerConnection:
@@ -57,14 +169,26 @@ class PeerConnection:
     If the connection with a remote peer drops, the PeerConnection will consume
     the next available peer from off the queue and try to connect to that one
     instead.
-    """
-    def __init__(self, queue: Queue, info_hash,
-                 peer_id, piece_manager, on_block_cb=None):
-        """
-        Constructs a PeerConnection and add it to the asyncio event-loop.
 
-        Use `stop` to abort this connection and any subsequent connection
-        attempts
+    This class uses modern asyncio features (Python 3.11+) including:
+    - Structured concurrency via TaskGroup
+    - Proper connection timeouts
+    - Clean resource cleanup with wait_closed()
+    - Block pipelining (MAX_PIPELINE_DEPTH requests in-flight)
+    - Peer statistics tracking for ranking and optimization
+    """
+    def __init__(self, queue: Queue, info_hash: bytes,
+                 peer_id: bytes, piece_manager: Any,
+                 on_block_cb: Callable[[bytes, int, int, bytes], None] | None = None,
+                 stats_callback: Callable[[bytes, int], None] | None = None):
+        """
+        Constructs a PeerConnection.
+
+        The connection is not started automatically. Call the async method
+        `run()` to start the connection worker, or use with TaskGroup.
+
+        Use `stop()` to abort this connection and any subsequent connection
+        attempts.
 
         :param queue: The async Queue containing available peers
         :param info_hash: The SHA1 hash for the meta-data's info
@@ -73,176 +197,377 @@ class PeerConnection:
                               to request
         :param on_block_cb: The callback function to call when a block is
                             received from the remote peer
+        :param stats_callback: Optional callback(peer_id, bytes_received) for
+                               statistics tracking
         """
-        self.my_state = []
-        self.peer_state = []
-        self.queue = queue
-        self.info_hash = info_hash
-        self.peer_id = peer_id
-        self.remote_id = None
-        self.writer = None
-        self.reader = None
-        self.piece_manager = piece_manager
-        self.on_block_cb = on_block_cb
-        self.future = asyncio.ensure_future(self._start())  # Start this worker
+        # Use sets for O(1) state lookups
+        self._my_state: set[ConnectionState] = set()
+        self._peer_state: set[ConnectionState] = set()
+        self._queue: Queue = queue
+        self._info_hash: bytes = info_hash
+        self._peer_id: bytes = peer_id
+        self._remote_id: bytes | None = None
+        self._writer: asyncio.StreamWriter | None = None
+        self._reader: asyncio.StreamReader | None = None
+        self._piece_manager = piece_manager
+        self._on_block_cb = on_block_cb
+        self._stats_callback = stats_callback
+        self._task: asyncio.Task | None = None
+        self._running = False
+        # Block pipelining: track in-flight requests to enable parallel requests
+        # This allows multiple blocks to be requested without waiting for responses
+        self._inflight_requests = 0
+        # Peer statistics for ranking
+        self._stats: PeerStats | None = None
 
-    async def _start(self):
-        while 'stopped' not in self.my_state:
-            ip, port = await self.queue.get()
-            logging.info('Got assigned peer with: {ip}'.format(ip=ip))
+    @property
+    def is_stopped(self) -> bool:
+        """Check if the connection has been stopped."""
+        return ConnectionState.STOPPED in self._my_state
 
+    @property
+    def is_choked(self) -> bool:
+        """Check if we are choked by the remote peer."""
+        return ConnectionState.CHOKED in self._my_state
+
+    @property
+    def is_interested(self) -> bool:
+        """Check if we are interested in the remote peer."""
+        return ConnectionState.INTERESTED in self._my_state
+
+    @property
+    def has_pending_request(self) -> bool:
+        """Check if we have any in-flight requests (for backward compat)."""
+        return self._inflight_requests > 0
+
+    @property
+    def has_pipeline_space(self) -> bool:
+        """Check if we can send more pipelined requests."""
+        return self._inflight_requests < MAX_PIPELINE_DEPTH
+
+    @property
+    def stats(self) -> PeerStats | None:
+        """Get the peer statistics."""
+        return self._stats
+
+    async def run(self) -> None:
+        """
+        Main connection loop that runs as an async task.
+
+        This method continuously consumes peers from the queue and attempts
+        to establish connections. It handles all protocol-level communication
+        and error recovery.
+
+        Should be run within a TaskGroup for structured concurrency.
+        """
+        self._running = True
+        self._my_state.clear()
+        self._peer_state.clear()
+
+        while not self.is_stopped:
             try:
-                # TODO For some reason it does not seem to work to open a new
-                # connection if the first one drops (i.e. second loop).
-                self.reader, self.writer = await asyncio.open_connection(
-                    ip, port)
-                logging.info('Connection open to peer: {ip}'.format(ip=ip))
+                # Wait for a peer from the queue
+                ip, port = await self._queue.get()
+                logging.info(f'Got assigned peer with: {ip}')
 
-                # It's our responsibility to initiate the handshake.
+                # Attempt connection with timeout
+                await self._connect_and_handle(ip, port)
+
+            except asyncio.CancelledError:
+                logging.debug('PeerConnection task cancelled')
+                raise
+            except Exception as e:
+                logging.exception(f'Unexpected error in PeerConnection: {e}')
+            finally:
+                # Ensure cleanup after each connection attempt
+                await self._cleanup_connection()
+
+    async def _connect_and_handle(self, ip: str, port: int) -> None:
+        """
+        Connect to a peer and handle the protocol exchange.
+
+        :param ip: Peer IP address
+        :param port: Peer port number
+        """
+        try:
+            # Use asyncio.timeout for connection timeout (Python 3.11+)
+            async with asyncio.timeout(CONNECTION_TIMEOUT):
+                self._reader, self._writer = await asyncio.open_connection(ip, port)
+            logging.info(f'Connection open to peer: {ip}')
+
+        except asyncio.TimeoutError:
+            logging.warning(f'Connection timeout to peer {ip}:{port}')
+            return
+        except (ConnectionRefusedError, OSError) as e:
+            logging.warning(f'Unable to connect to peer {ip}:{port}: {e}')
+            return
+
+        try:
+            # Perform handshake with timeout
+            async with asyncio.timeout(HANDSHAKE_TIMEOUT):
                 buffer = await self._handshake()
 
-                # TODO Add support for sending data
-                # Sending BitField is optional and not needed when client does
-                # not have any pieces. Thus we do not send any bitfield message
+            # Initialize peer statistics after successful handshake
+            self._stats = PeerStats(
+                peer_id=self._remote_id,
+                is_choked=True,
+                connection_start_time=time.time()
+            )
 
-                # The default state for a connection is that peer is not
-                # interested and we are choked
-                self.my_state.append('choked')
+            # Initialize connection state
+            self._my_state.add(ConnectionState.CHOKED)
 
-                # Let the peer know we're interested in downloading pieces
-                await self._send_interested()
-                self.my_state.append('interested')
+            # Send interested message
+            await self._send_interested()
+            self._my_state.add(ConnectionState.INTERESTED)
 
-                # Start reading responses as a stream of messages for as
-                # long as the connection is open and data is transmitted
-                async for message in PeerStreamIterator(self.reader, buffer):
-                    if 'stopped' in self.my_state:
-                        break
-                    if type(message) is BitField:
-                        self.piece_manager.add_peer(self.remote_id,
-                                                    message.bitfield)
-                    elif type(message) is Interested:
-                        self.peer_state.append('interested')
-                    elif type(message) is NotInterested:
-                        if 'interested' in self.peer_state:
-                            self.peer_state.remove('interested')
-                    elif type(message) is Choke:
-                        self.my_state.append('choked')
-                    elif type(message) is Unchoke:
-                        if 'choked' in self.my_state:
-                            self.my_state.remove('choked')
-                    elif type(message) is Have:
-                        self.piece_manager.update_peer(self.remote_id,
-                                                       message.index)
-                    elif type(message) is KeepAlive:
-                        pass
-                    elif type(message) is Piece:
-                        self.my_state.remove('pending_request')
-                        self.on_block_cb(
-                            peer_id=self.remote_id,
-                            piece_index=message.index,
-                            block_offset=message.begin,
-                            data=message.block)
-                    elif type(message) is Request:
-                        # TODO Add support for sending data
-                        logging.info('Ignoring the received Request message.')
-                    elif type(message) is Cancel:
-                        # TODO Add support for sending data
-                        logging.info('Ignoring the received Cancel message.')
+            # Process messages from peer
+            await self._process_messages(buffer)
 
-                    # Send block request to remote peer if we're interested
-                    if 'choked' not in self.my_state:
-                        if 'interested' in self.my_state:
-                            if 'pending_request' not in self.my_state:
-                                self.my_state.append('pending_request')
-                                await self._request_piece()
+        except asyncio.TimeoutError:
+            logging.warning(f'Handshake timeout with peer {ip}:{port}')
+        except ProtocolError as e:
+            logging.warning(f'Protocol error with peer {ip}:{port}: {e}')
+        except (ConnectionResetError, BrokenPipeError) as e:
+            logging.warning(f'Connection closed by peer {ip}:{port}: {e}')
+        except CancelledError:
+            logging.debug(f'Connection cancelled for peer {ip}:{port}')
+            raise
 
-            except ProtocolError as e:
-                logging.exception('Protocol error')
-            except (ConnectionRefusedError, TimeoutError):
-                logging.warning('Unable to connect to peer')
-            except (ConnectionResetError, CancelledError):
-                logging.warning('Connection closed')
-            except Exception as e:
-                logging.exception('An error occurred')
-                self.cancel()
-                raise e
-            self.cancel()
-
-    def cancel(self):
+    async def _process_messages(self, initial_buffer: bytes) -> None:
         """
-        Sends the cancel message to the remote peer and closes the connection.
-        """
-        logging.info('Closing peer {id}'.format(id=self.remote_id))
-        if not self.future.done():
-            self.future.cancel()
-        if self.writer:
-            self.writer.close()
+        Process incoming messages from the peer with block pipelining.
 
-        self.queue.task_done()
+        Block pipelining allows multiple requests to be in-flight simultaneously,
+        hiding network latency. After each message (especially Piece responses),
+        we refill the pipeline if there's space.
 
-    def stop(self):
+        :param initial_buffer: Any data already read during handshake
         """
-        Stop this connection from the current peer (if a connection exist) and
-        from connecting to any new peer.
-        """
-        # Set state to stopped and cancel our future to break out of the loop.
-        # The rest of the cleanup will eventually be managed by loop calling
-        # `cancel`.
-        self.my_state.append('stopped')
-        if not self.future.done():
-            self.future.cancel()
+        async for message in PeerStreamIterator(self._reader, initial_buffer):
+            if self.is_stopped:
+                break
 
-    async def _request_piece(self):
-        block = self.piece_manager.next_request(self.remote_id)
+            # Handle different message types
+            await self._handle_message(message)
+
+            # Pipelining: fill the pipeline with requests if unchoked and interested
+            # This enables parallel block requests, significantly improving throughput
+            # on high-latency connections by hiding RTT.
+            await self._fill_pipeline()
+
+    async def _fill_pipeline(self) -> None:
+        """
+        Fill the request pipeline up to MAX_PIPELINE_DEPTH.
+
+        Called after message processing to maintain optimal request parallelism.
+        Only requests new blocks if unchoked, interested, and there's space.
+        """
+        if self.is_stopped:
+            return
+        if self.is_choked:
+            return
+        if not self.is_interested:
+            return
+
+        # Request blocks until pipeline is full
+        while self.has_pipeline_space:
+            block = self._piece_manager.next_request(self._remote_id)
+            if block is None:
+                break  # No more blocks available
+
+            self._inflight_requests += 1
+            await self._send_request(block)
+
+    async def _send_request(self, block: Any) -> None:
+        """
+        Send a single block request to the peer.
+
+        :param block: The block to request
+        """
+        if self._writer is None:
+            return
+
+        message = Request(block.piece, block.offset, block.length).encode()
+
+        logging.debug(
+            f'Requesting block {block.offset} for piece {block.piece} '
+            f'of {block.length} bytes from peer {self._remote_id} '
+            f'(inflight: {self._inflight_requests}/{MAX_PIPELINE_DEPTH})'
+        )
+
+        self._writer.write(message)
+        await self._writer.drain()
+
+    async def _handle_message(self, message: Any) -> None:
+        """
+        Handle a single protocol message.
+
+        :param message: The parsed protocol message
+        """
+        match type(message):
+            case type() if type(message) is BitField:
+                self._piece_manager.add_peer(self._remote_id, message.bitfield)
+            case type() if type(message) is Interested:
+                self._peer_state.add(ConnectionState.INTERESTED)
+            case type() if type(message) is NotInterested:
+                self._peer_state.discard(ConnectionState.INTERESTED)
+            case type() if type(message) is Choke:
+                self._my_state.add(ConnectionState.CHOKED)
+                # Update stats
+                if self._stats:
+                    self._stats.is_choked = True
+                # On choke, we don't cancel inflight - they'll complete or timeout
+            case type() if type(message) is Unchoke:
+                self._my_state.discard(ConnectionState.CHOKED)
+                # Update stats
+                if self._stats:
+                    self._stats.is_choked = False
+                # On unchoke, immediately try to fill pipeline
+                await self._fill_pipeline()
+            case type() if type(message) is Have:
+                self._piece_manager.update_peer(self._remote_id, message.index)
+            case type() if type(message) is KeepAlive:
+                pass  # Keep-alive has no payload
+            case type() if type(message) is Piece:
+                # Decrement inflight count - this block response completed
+                if self._inflight_requests > 0:
+                    self._inflight_requests -= 1
+                # Record statistics
+                block_size = len(message.block)
+                if self._stats:
+                    self._stats.record_block(block_size)
+                if self._stats_callback:
+                    self._stats_callback(self._remote_id, block_size)
+                if self._on_block_cb:
+                    self._on_block_cb(
+                        peer_id=self._remote_id,
+                        piece_index=message.index,
+                        block_offset=message.begin,
+                        data=message.block
+                    )
+            case type() if type(message) is Request:
+                logging.info('Ignoring received Request message (upload not supported)')
+            case type() if type(message) is Cancel:
+                logging.info('Ignoring received Cancel message (upload not supported)')
+            case _:
+                logging.debug(f'Received unhandled message type: {type(message).__name__}')
+
+    async def _cleanup_connection(self) -> None:
+        """
+        Clean up the current connection resources.
+
+        This ensures proper cleanup of the StreamWriter and removes
+        the peer from the piece manager.
+        """
+        # Log final stats for this peer
+        if self._stats and self._stats.bytes_downloaded > 0:
+            logging.info(
+                f'Peer {self._remote_id}: downloaded {self._stats.bytes_downloaded} bytes '
+                f'({self._stats.blocks_received} blocks) at '
+                f'{self._stats.download_rate/1024:.1f} KB/s'
+            )
+
+        # Remove peer from piece manager
+        if self._remote_id is not None:
+            self._piece_manager.remove_peer(self._remote_id)
+            logging.info(f'Closing peer {self._remote_id}')
+
+        # Properly close the writer
+        if self._writer is not None:
+            self._writer.close()
+            try:
+                await self._writer.wait_closed()
+            except Exception:
+                pass  # Ignore errors during cleanup
+            self._writer = None
+            self._reader = None
+
+        # Mark queue task as done
+        try:
+            self._queue.task_done()
+        except ValueError:
+            pass  # Queue might already be empty or task already done
+
+        # Clear remote ID and reset inflight counter
+        self._remote_id = None
+        self._inflight_requests = 0
+        # Reset stats for next connection
+        self._stats = None
+
+    def stop(self) -> None:
+        """
+        Stop this connection from the current peer and prevent
+        connecting to any new peers.
+
+        This method is idempotent and can be called from any context.
+        """
+        self._my_state.add(ConnectionState.STOPPED)
+        self._running = False
+
+    async def _request_piece(self) -> None:
+        """Request the next piece from the remote peer."""
+        if self._remote_id is None or self._writer is None:
+            return
+
+        block = self._piece_manager.next_request(self._remote_id)
         if block:
             message = Request(block.piece, block.offset, block.length).encode()
 
-            logging.debug('Requesting block {block} for piece {piece} '
-                          'of {length} bytes from peer {peer}'.format(
-                            piece=block.piece,
-                            block=block.offset,
-                            length=block.length,
-                            peer=self.remote_id))
+            logging.debug(
+                f'Requesting block {block.offset} for piece {block.piece} '
+                f'of {block.length} bytes from peer {self._remote_id}'
+            )
 
-            self.writer.write(message)
-            await self.writer.drain()
+            self._writer.write(message)
+            await self._writer.drain()
 
-    async def _handshake(self):
+    async def _handshake(self) -> bytes:
         """
         Send the initial handshake to the remote peer and wait for the peer
         to respond with its handshake.
+
+        :return: Any remaining buffer data after the handshake
+        :raises ProtocolError: If handshake fails
         """
-        self.writer.write(Handshake(self.info_hash, self.peer_id).encode())
-        await self.writer.drain()
+        if self._writer is None or self._reader is None:
+            raise ProtocolError('Connection not established')
+
+        self._writer.write(Handshake(self._info_hash, self._peer_id).encode())
+        await self._writer.drain()
 
         buf = b''
-        tries = 1
-        while len(buf) < Handshake.length and tries < 10:
+        tries = 0
+        max_tries = 10
+
+        while len(buf) < Handshake.length and tries < max_tries:
             tries += 1
-            buf = await self.reader.read(PeerStreamIterator.CHUNK_SIZE)
+            chunk = await self._reader.read(PeerStreamIterator.CHUNK_SIZE)
+            if not chunk:
+                raise ProtocolError('Connection closed during handshake')
+            buf += chunk
 
         response = Handshake.decode(buf[:Handshake.length])
         if not response:
-            raise ProtocolError('Unable receive and parse a handshake')
-        if not response.info_hash == self.info_hash:
+            raise ProtocolError('Unable to receive and parse a handshake')
+        if response.info_hash != self._info_hash:
             raise ProtocolError('Handshake with invalid info_hash')
 
-        # TODO: According to spec we should validate that the peer_id received
-        # from the peer match the peer_id received from the tracker.
-        self.remote_id = response.peer_id
+        self._remote_id = response.peer_id
         logging.info('Handshake with peer was successful')
 
-        # We need to return the remaining buffer data, since we might have
-        # read more bytes then the size of the handshake message and we need
-        # those bytes to parse the next message.
+        # Return remaining buffer data
         return buf[Handshake.length:]
 
-    async def _send_interested(self):
+    async def _send_interested(self) -> None:
+        """Send an interested message to the remote peer."""
+        if self._writer is None:
+            return
+
         message = Interested()
-        logging.debug('Sending message: {type}'.format(type=message))
-        self.writer.write(message.encode())
-        await self.writer.drain()
+        logging.debug(f'Sending message: {message}')
+        self._writer.write(message.encode())
+        await self._writer.drain()
 
 
 class PeerStreamIterator:
